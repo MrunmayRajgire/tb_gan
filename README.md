@@ -10,8 +10,12 @@ This project implements a tuberculosis detection system using chest X-ray images
   - [Training the Classifier](#training-the-classifier)
   - [Training the DCGAN](#training-the-dcgan)
 - [Classification](#classification)
+- [Classification Results](#classification-results)
 - [Visualization (GRAD-CAM)](#visualization-grad-cam)
 - [Generated Images](#generated-images)
+- [Model Validation](#model-validation)
+  - [Classifier Validation](#classifier-validation)
+  - [DCGAN Validation](#dcgan-validation)
 
 ## Installation
 
@@ -106,6 +110,18 @@ Parameters:
 - `--batch_mode`: Enable batch processing of directory
 - `--output_csv`: Path to save classification results
 
+## Classification Results
+
+The ResNet-based classifier achieved excellent performance on the test dataset:
+- Accuracy: 99.48%
+- Precision: 98.02%
+- Recall: 98.86%
+- F1 Score: 98.44%
+- AUC: 0.9998
+- PR-AUC: 0.9989
+
+Detailed results including confusion matrices and ROC curves can be found in the `results/validation/` directory.
+
 ## Visualization (GRAD-CAM)
 
 ### Basic GRAD-CAM (Recommended)
@@ -154,23 +170,41 @@ Generate new TB X-ray images using trained DCGAN:
 # Coming soon - use DCGAN to generate new images
 ```
 
-## Debug Model Architecture
+## Model Validation
 
-To debug model architecture for development purposes:
+### Classifier Validation
 
-```bash
-python src/debug_model.py
-```
-
-This will print detailed information about the model architecture and layer structure.
-
-## Main Script
-
-Run the main workflow:
+Validate the classifier performance on the test dataset:
 
 ```bash
-python main.py
+python src/validate_model.py --model_path output_20250423_211607/classifier/models/best_classifier_model.pth --data_dir dataset/TB_Chest_Radiography_Database --output_dir results/validation --model_type resnet
 ```
+
+Parameters:
+- `--model_path`: Path to saved model weights
+- `--data_dir`: Path to test dataset
+- `--output_dir`: Directory to save validation results
+- `--model_type`: Model architecture (`resnet` or `simple`)
+
+### DCGAN Validation
+
+Validate the DCGAN-generated images against real images using FID score:
+
+```bash
+python src/validate_dcgan.py --class_name Normal --epoch 50 --data_dir dataset/TB_Chest_Radiography_Database --output_dir results/dcgan_validation/normal
+```
+
+```bash
+python src/validate_dcgan.py --class_name Tuberculosis --epoch 50 --data_dir dataset/TB_Chest_Radiography_Database --output_dir results/dcgan_validation/tuberculosis
+```
+
+Parameters:
+- `--class_name`: Class to validate ('Normal' or 'Tuberculosis')
+- `--epoch`: Epoch number of the trained model to use
+- `--data_dir`: Path to dataset directory
+- `--output_dir`: Directory to save validation results
+
+For the Normal class, the DCGAN achieved an FID score of 578.1152, indicating moderate similarity between generated and real images. Lower FID scores indicate better quality and similarity.
 
 ---
 

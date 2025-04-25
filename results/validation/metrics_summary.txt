@@ -1,0 +1,21 @@
+Model Type: RESNET
+Accuracy: 99.48%
+Precision: 98.02%
+Recall: 98.86%
+F1 Score: 98.44%
+AUC: 0.9998
+PR-AUC: 0.9989
+
+Confusion Matrix:
+[[3486,   14],
+ [   8,  692]]
+
+Detailed Classification Report:
+              precision    recall  f1-score   support
+
+      Normal       1.00      1.00      1.00      3500
+Tuberculosis       0.98      0.99      0.98       700
+
+    accuracy                           0.99      4200
+   macro avg       0.99      0.99      0.99      4200
+weighted avg       0.99      0.99      0.99      4200
