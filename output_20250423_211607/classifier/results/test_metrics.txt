@@ -1,0 +1,6 @@
+Model type: resnet
+Generated images used: True
+Test Accuracy: 98.81%
+Test Precision: 98.82%
+Test Recall: 98.81%
+Test F1 Score: 98.81%
