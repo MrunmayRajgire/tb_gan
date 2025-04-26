@@ -9,110 +9,15 @@ from PIL import Image
 import cv2
 from tqdm import tqdm
 
+# Import pytorch-grad-cam modules
+from pytorch_grad_cam import GradCAM, HiResCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM, EigenCAM, FullGrad
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
 # Import custom modules
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.classifier import XRayClassifier, SimpleXRayClassifier
-
-class GradCAM:
-    """
-    Implements Gradient-weighted Class Activation Mapping (GRAD-CAM) for CNN visualization.
-    """
-    def __init__(self, model, target_layer, device):
-        """
-        Initialize GradCAM.
-        
-        Args:
-            model: Trained model
-            target_layer: The layer to extract gradients from
-            device: Device to run the model on
-        """
-        self.model = model
-        self.target_layer = target_layer
-        self.device = device
-        self.model.to(device)
-        self.model.eval()
-        
-        # Feature map and gradient storage
-        self.gradients = None
-        self.activations = None
-        
-        # Register hooks
-        self.handle_forward = self.target_layer.register_forward_hook(self._forward_hook)
-        self.handle_backward = self.target_layer.register_full_backward_hook(self._backward_hook)
-    
-    def _forward_hook(self, module, input, output):
-        """Store the activations of the target layer."""
-        self.activations = output.detach()
-    
-    def _backward_hook(self, module, grad_input, grad_output):
-        """Store the gradients of the target layer."""
-        self.gradients = grad_output[0].detach()
-    
-    def remove_hooks(self):
-        """Remove the registered hooks."""
-        self.handle_forward.remove()
-        self.handle_backward.remove()
-        
-    def generate_cam(self, image_tensor, target_class=None):
-        """
-        Generate the GRAD-CAM visualization.
-        
-        Args:
-            image_tensor: Input image tensor [1, C, H, W]
-            target_class: Target class index. If None, uses predicted class.
-            
-        Returns:
-            cam: Heatmap with same dimensions as input image
-            prediction: Predicted class
-            confidence: Prediction confidence
-        """
-        # Forward pass
-        image_tensor = image_tensor.to(self.device)
-        self.model.zero_grad()
-        output = self.model(image_tensor)
-        pred_probabilities = F.softmax(output, dim=1)
-        
-        # Get prediction
-        if target_class is None:
-            predicted_class = torch.argmax(pred_probabilities, dim=1).item()
-            confidence = pred_probabilities[0, predicted_class].item() * 100
-        else:
-            predicted_class = target_class
-            confidence = pred_probabilities[0, target_class].item() * 100
-        
-        # Backward pass to get gradients
-        output_class = output[0, predicted_class]
-        output_class.backward()
-        
-        # Ensure gradients and activations are available
-        if self.gradients is None or self.activations is None:
-            print("Warning: Gradients or activations not captured. Check layer selection.")
-            # Return a blank heatmap
-            return np.zeros((1, 1)), predicted_class, confidence
-        
-        # Global average pooling of gradients
-        pooled_gradients = torch.mean(self.gradients, dim=(0, 2, 3))
-        
-        # Create class activation map
-        batch_size, channels, height, width = self.activations.size()
-        cam = torch.zeros(height, width, dtype=torch.float32, device=self.device)
-        
-        # Weighted sum of activation maps
-        for i in range(channels):
-            cam += pooled_gradients[i] * self.activations[0, i, :, :]
-            
-        # Apply ReLU
-        cam = torch.relu(cam)
-        
-        # Normalize
-        if torch.max(cam) > 0:
-            cam = cam / torch.max(cam)
-            
-        # Resize to image size
-        cam = cam.cpu().numpy()
-        
-        return cam, predicted_class, confidence
 
 def get_target_layer(model, model_type):
     """
@@ -125,15 +30,63 @@ def get_target_layer(model, model_type):
     Returns:
         Target layer for GRAD-CAM
     """
+    target_layers = []
+    
     if model_type.lower() == 'resnet':
-        # The proper way to access the final conv layer based on the model structure
-        # For ResNet-50, we want to use the last convolutional layer before the fully connected layers
-        # Based on the debug output, this is model.layer4[2].conv3
-        return model.model.layer4[2].conv3
+        # For ResNet models, try different layers in order of preference
+        candidate_layers = [
+            lambda m: m.model.layer4[-1],
+            lambda m: m.model.layer4[-1].conv2,
+            lambda m: m.model.layer3[-1],
+            lambda m: m.model.layer2[-1],
+            lambda m: m.model.layer1[-1]
+        ]
     else:  # 'simple'
-        # For SimpleXRayClassifier, use the last convolutional layer (index 12) before max pooling
-        # Based on the debug output, features.12 is the last Conv2d layer
-        return model.features[12]
+        # For SimpleXRayClassifier, try different layers
+        candidate_layers = [
+            lambda m: m.features[-1],  # Last layer in features
+            lambda m: m.features[-2],  # Second to last layer
+            lambda m: m.features[12] if len(m.features) > 12 else None,
+            lambda m: m.features[8] if len(m.features) > 8 else None,
+            lambda m: m.features[4] if len(m.features) > 4 else None
+        ]
+    
+    # Try each candidate layer until one works
+    for get_layer in candidate_layers:
+        try:
+            layer = get_layer(model)
+            if layer is not None:
+                target_layers.append(layer)
+                print(f"Successfully found target layer: {layer}")
+                break
+        except (AttributeError, IndexError) as e:
+            continue
+    
+    # If no layers were found, try a more desperate approach
+    if not target_layers:
+        print("Warning: Couldn't find standard target layers, attempting to use named modules")
+        # Find any convolutional layer, starting from the end of the network
+        conv_modules = []
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                conv_modules.append((name, module))
+        
+        # Take the last convolutional layer (closer to output)
+        if conv_modules:
+            name, module = conv_modules[-1]  # Get the last conv layer
+            target_layers.append(module)
+            print(f"Using fallback convolutional layer: {name}")
+    
+    if not target_layers:
+        print("ERROR: Could not identify suitable target layer. Using a placeholder that may not work correctly.")
+        # Last resort - try to find any module with parameters
+        for name, module in model.named_modules():
+            if list(module.parameters()):
+                target_layers.append(module)
+                print(f"Using emergency fallback layer: {name}")
+                break
+        
+    return target_layers
 
 def preprocess_image(image_path, image_size=128):
     """
@@ -160,9 +113,9 @@ def preprocess_image(image_path, image_size=128):
     return input_tensor, original_image
 
 def visualize_gradcam(image_path, model, model_type='resnet', target_class=None, 
-                     image_size=128, output_path=None, device=None):
+                     image_size=128, output_path=None, device=None, cam_algorithm='gradcam'):
     """
-    Generate and visualize GRAD-CAM for a given image.
+    Generate and visualize GRAD-CAM for a given image using prebuilt PyTorch modules.
     
     Args:
         image_path: Path to the input image
@@ -172,42 +125,128 @@ def visualize_gradcam(image_path, model, model_type='resnet', target_class=None,
         image_size: Image size for processing
         output_path: Path to save the visualization (None to display it)
         device: Device to run on
+        cam_algorithm: Which CAM algorithm to use ('gradcam', 'gradcam++', 'xgradcam', etc.)
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Ensure model is on the right device and in eval mode
+    model = model.to(device)
+    model.eval()
+    
     # Preprocess image
     input_tensor, original_image = preprocess_image(image_path, image_size)
+    input_tensor = input_tensor.to(device)
+    
+    # Get prediction first
+    with torch.no_grad():
+        pred_probabilities = model(input_tensor)
+        
+    if target_class is None:
+        predicted_class = torch.argmax(pred_probabilities, dim=1).item()
+    else:
+        predicted_class = target_class
+    
+    confidence = pred_probabilities[0, predicted_class].item() * 100
     
     # Get target layer for GRAD-CAM
-    target_layer = get_target_layer(model, model_type)
+    target_layers = get_target_layer(model, model_type)
+    print(f"Using target layers: {target_layers}")
     
-    # Initialize GradCAM
-    grad_cam = GradCAM(model, target_layer, device)
+    # If no target layers were found, we can't proceed with CAM
+    if not target_layers:
+        print("No target layers found. Cannot generate CAM visualization.")
+        rgb_img = input_tensor[0].cpu().permute(1, 2, 0).numpy()
+        rgb_img = (rgb_img * 0.5 + 0.5)  # Denormalize
+        rgb_img = np.clip(rgb_img, 0, 1)  # Ensure values are in [0, 1]
+        cam_image = (rgb_img * 255).astype(np.uint8)
+        class_labels = {0: 'Normal', 1: 'Tuberculosis'}
+        predicted_label = class_labels[predicted_class]
+        
+        # Create figure with just the original image and prediction
+        plt.figure(figsize=(12, 6))
+        
+        plt.subplot(1, 2, 1)
+        plt.imshow(original_image)
+        plt.title(f"Original: {os.path.basename(image_path)}")
+        plt.axis('off')
+        
+        plt.subplot(1, 2, 2)
+        plt.imshow(rgb_img)
+        plt.title(f"Prediction: {predicted_label} ({confidence:.2f}%)")
+        plt.axis('off')
+        
+        plt.tight_layout()
+        
+        if output_path:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            plt.savefig(output_path, bbox_inches='tight')
+            print(f"Prediction visualization saved to {output_path}")
+        else:
+            plt.show()
+        
+        plt.close()
+        
+        return predicted_label, confidence
     
-    # Generate GRAD-CAM
-    heatmap, predicted_class, confidence = grad_cam.generate_cam(input_tensor, target_class)
+    # Select CAM algorithm
+    cam_algorithms = {
+        'gradcam': GradCAM,
+        'hirescam': HiResCAM,
+        'scorecam': ScoreCAM,
+        'gradcam++': GradCAMPlusPlus,
+        'xgradcam': XGradCAM,
+        'eigencam': EigenCAM,
+        'ablationcam': AblationCAM,
+        'fullgrad': FullGrad
+    }
     
-    # Clean up hooks
-    grad_cam.remove_hooks()
+    cam_algorithm_class = cam_algorithms.get(cam_algorithm.lower(), GradCAM)
+    
+    # Convert image tensor to numpy for visualization
+    rgb_img = input_tensor[0].cpu().permute(1, 2, 0).numpy()
+    rgb_img = (rgb_img * 0.5 + 0.5)  # Denormalize
+    rgb_img = np.clip(rgb_img, 0, 1)  # Ensure values are in [0, 1]
+    
+    try:
+        # Initialize the selected CAM algorithm without use_cuda parameter
+        cam = cam_algorithm_class(
+            model=model, 
+            target_layers=target_layers
+        )
+        
+        # Define target for CAM
+        targets = [ClassifierOutputTarget(predicted_class)]
+        
+        # Generate CAM with proper input shape
+        input_tensor_for_cam = input_tensor.clone().requires_grad_(True)
+        
+        # Generate CAM and handle potential errors
+        grayscale_cam = cam(input_tensor=input_tensor_for_cam, targets=targets)
+        
+        # Explicitly check if grayscale_cam is None or empty
+        if grayscale_cam is None or len(grayscale_cam) == 0 or grayscale_cam.size == 0:
+            print("Warning: CAM generation returned empty result. Using fallback visualization.")
+            raise ValueError("CAM generation failed - returned None or empty array")
+            
+        # Ensure we have a valid grayscale_cam with the right shape
+        if grayscale_cam.shape[0] > 0:  
+            grayscale_cam = grayscale_cam[0, :]  # Take the first image in batch
+            
+            # Get CAM overlay on image
+            cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
+        else:
+            raise ValueError("CAM generation failed - returned array with invalid shape")
+            
+    except Exception as e:
+        print(f"Error generating CAM: {str(e)}")
+        print("Falling back to original image with prediction overlay")
+        # Fallback to just the original image
+        cam_image = (rgb_img * 255).astype(np.uint8)
     
     # Class labels
     class_labels = {0: 'Normal', 1: 'Tuberculosis'}
     predicted_label = class_labels[predicted_class]
-    
-    # Resize heatmap to match original image size
-    original_size = original_image.size
-    heatmap_resized = cv2.resize(heatmap, original_size)
-    
-    # Convert heatmap to RGB
-    heatmap_rgb = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    heatmap_rgb = cv2.cvtColor(heatmap_rgb, cv2.COLOR_BGR2RGB)
-    
-    # Convert PIL image to numpy array for overlay
-    image_np = np.array(original_image)
-    
-    # Create overlay (0.7 * image + 0.3 * heatmap)
-    cam_output = (0.7 * image_np + 0.3 * heatmap_rgb).astype(np.uint8)
     
     # Create figure with original image and GRAD-CAM overlay
     plt.figure(figsize=(12, 6))
@@ -218,8 +257,8 @@ def visualize_gradcam(image_path, model, model_type='resnet', target_class=None,
     plt.axis('off')
     
     plt.subplot(1, 2, 2)
-    plt.imshow(cam_output)
-    plt.title(f"GRAD-CAM: {predicted_label} ({confidence:.2f}%)")
+    plt.imshow(cam_image)
+    plt.title(f"{cam_algorithm.upper()}: {predicted_label} ({confidence:.2f}%)")
     plt.axis('off')
     
     plt.tight_layout()
@@ -235,7 +274,7 @@ def visualize_gradcam(image_path, model, model_type='resnet', target_class=None,
     
     return predicted_label, confidence
 
-def batch_process_directory(input_dir, model, model_type, output_dir, image_size=128, device=None):
+def batch_process_directory(input_dir, model, model_type, output_dir, image_size=128, device=None, cam_algorithm='gradcam'):
     """
     Process all images in a directory with GRAD-CAM.
     
@@ -246,6 +285,7 @@ def batch_process_directory(input_dir, model, model_type, output_dir, image_size
         output_dir: Directory to save visualizations
         image_size: Image size for processing
         device: Device to run on
+        cam_algorithm: Which CAM algorithm to use
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -262,61 +302,19 @@ def batch_process_directory(input_dir, model, model_type, output_dir, image_size
     
     print(f"Found {len(image_files)} images in {input_dir}")
     
-    # Get target layer for GRAD-CAM
-    target_layer = get_target_layer(model, model_type)
-    
-    # Initialize GradCAM
-    grad_cam = GradCAM(model, target_layer, device)
-    
     # Process each image
     results = []
-    for img_path in tqdm(image_files, desc="Generating GRAD-CAM visualizations"):
+    for img_path in tqdm(image_files, desc=f"Generating {cam_algorithm.upper()} visualizations"):
         try:
             # Create output path
             rel_path = os.path.relpath(img_path, input_dir)
-            output_path = os.path.join(output_dir, f"{os.path.splitext(rel_path)[0]}_gradcam.png")
+            output_path = os.path.join(output_dir, f"{os.path.splitext(rel_path)[0]}_{cam_algorithm.lower()}.png")
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
-            # Preprocess image
-            input_tensor, original_image = preprocess_image(img_path, image_size)
-            
-            # Generate GRAD-CAM
-            heatmap, predicted_class, confidence = grad_cam.generate_cam(input_tensor)
-            
-            # Class labels
-            class_labels = {0: 'Normal', 1: 'Tuberculosis'}
-            predicted_label = class_labels[predicted_class]
-            
-            # Resize heatmap to match original image size
-            original_size = original_image.size
-            heatmap_resized = cv2.resize(heatmap, original_size)
-            
-            # Convert heatmap to RGB
-            heatmap_rgb = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-            heatmap_rgb = cv2.cvtColor(heatmap_rgb, cv2.COLOR_BGR2RGB)
-            
-            # Convert PIL image to numpy array for overlay
-            image_np = np.array(original_image)
-            
-            # Create overlay
-            cam_output = (0.7 * image_np + 0.3 * heatmap_rgb).astype(np.uint8)
-            
-            # Create figure with original image and GRAD-CAM overlay
-            plt.figure(figsize=(12, 6))
-            
-            plt.subplot(1, 2, 1)
-            plt.imshow(original_image)
-            plt.title(f"Original: {os.path.basename(img_path)}")
-            plt.axis('off')
-            
-            plt.subplot(1, 2, 2)
-            plt.imshow(cam_output)
-            plt.title(f"GRAD-CAM: {predicted_label} ({confidence:.2f}%)")
-            plt.axis('off')
-            
-            plt.tight_layout()
-            plt.savefig(output_path, bbox_inches='tight')
-            plt.close()
+            # Process the image
+            predicted_label, confidence = visualize_gradcam(
+                img_path, model, model_type, None, image_size, output_path, device, cam_algorithm
+            )
             
             # Add to results
             results.append({
@@ -329,10 +327,7 @@ def batch_process_directory(input_dir, model, model_type, output_dir, image_size
         except Exception as e:
             print(f"Error processing {img_path}: {str(e)}")
     
-    # Clean up hooks
-    grad_cam.remove_hooks()
-    
-    print(f"GRAD-CAM visualizations saved to {output_dir}")
+    print(f"{cam_algorithm.upper()} visualizations saved to {output_dir}")
     
     # Return results summary
     return results
@@ -373,6 +368,9 @@ def main():
     parser.add_argument('--model_type', type=str, choices=['simple', 'resnet'], default='resnet', help='Model architecture')
     parser.add_argument('--image_size', type=int, default=128, help='Image size for processing')
     parser.add_argument('--batch_mode', action='store_true', help='Process entire directory in batch')
+    parser.add_argument('--cam_algorithm', type=str, default='gradcam', 
+                        choices=['gradcam', 'gradcam++', 'xgradcam', 'scorecam', 'eigencam', 'ablationcam', 'fullgrad', 'hirescam'],
+                        help='CAM algorithm to use')
     args = parser.parse_args()
     
     # Load model
@@ -384,12 +382,12 @@ def main():
             args.output = os.path.join('./results/gradcam', os.path.basename(args.input))
         
         batch_process_directory(
-            args.input, model, args.model_type, args.output, args.image_size, device
+            args.input, model, args.model_type, args.output, args.image_size, device, args.cam_algorithm
         )
     else:
         # Process single image
         visualize_gradcam(
-            args.input, model, args.model_type, None, args.image_size, args.output, device
+            args.input, model, args.model_type, None, args.image_size, args.output, device, args.cam_algorithm
         )
 
 if __name__ == "__main__":

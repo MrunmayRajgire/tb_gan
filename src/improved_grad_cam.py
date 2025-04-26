@@ -21,11 +21,24 @@ class SimpleGradCAM:
     """
     A simpler and more robust implementation of GRAD-CAM that works better with complex models
     """
-    def __init__(self, model, target_layer):
+    def __init__(self, model, target_layer, use_cuda=False):
+        """
+        Initialize SimpleGradCAM
+        
+        Args:
+            model (torch.nn.Module): The model to use
+            target_layer (torch.nn.Module): The target layer to use for Grad-CAM
+            use_cuda (bool): Whether to use CUDA for computation
+        """
         self.model = model
         self.target_layer = target_layer
         self.feature_maps = None
         self.gradients = None
+        self.use_cuda = use_cuda and torch.cuda.is_available()
+        
+        # Set device
+        self.device = torch.device('cuda' if self.use_cuda else 'cpu')
+        self.model = self.model.to(self.device)
         
         # Register hooks
         self.target_layer.register_forward_hook(self._forward_hook)
@@ -40,30 +53,47 @@ class SimpleGradCAM:
         self.gradients = grad_out[0]
     
     def __call__(self, x, class_idx=None):
-        """Generate CAM for the given class"""
+        """
+        Generate CAM for the given class
+        
+        Args:
+            x (torch.Tensor): Input tensor
+            class_idx (int, optional): Class index to generate CAM for. If None, uses the predicted class.
+            
+        Returns:
+            tuple: (heatmap, class_idx, score)
+        """
         # Set model to eval mode
         self.model.eval()
         
-        # Forward pass
+        # Reset stored values
         self.feature_maps = None
         self.gradients = None
         
-        # Get model prediction
-        logits = self.model(x)
-        probs = F.softmax(logits, dim=1)
+        # Move input to device
+        x = x.to(self.device)
         
-        # Get the class with highest probability if not specified
-        if class_idx is None:
-            class_idx = torch.argmax(probs, dim=1).item()
-        
-        # Get score for the selected class
-        score = probs[0, class_idx].item()
-        
-        # Backward pass for the selected class
-        self.model.zero_grad()
-        one_hot = torch.zeros_like(logits)
-        one_hot[0, class_idx] = 1
-        logits.backward(gradient=one_hot, retain_graph=True)
+        try:
+            # Forward pass
+            with torch.set_grad_enabled(True):
+                logits = self.model(x)
+                probs = F.softmax(logits, dim=1)
+                
+                # Get the class with highest probability if not specified
+                if class_idx is None:
+                    class_idx = torch.argmax(probs, dim=1).item()
+                
+                # Get score for the selected class
+                score = probs[0, class_idx].item()
+                
+                # Backward pass for the selected class
+                self.model.zero_grad()
+                one_hot = torch.zeros_like(logits)
+                one_hot[0, class_idx] = 1
+                logits.backward(gradient=one_hot, retain_graph=True)
+        except Exception as e:
+            print(f"Error during model inference: {str(e)}")
+            return None, None, 0.0
         
         # Check if feature maps and gradients were captured
         if self.feature_maps is None or self.gradients is None:
@@ -71,27 +101,133 @@ class SimpleGradCAM:
             return None, class_idx, score
         
         # Calculate CAM
-        # Global average pooling of gradients
-        pooled_gradients = torch.mean(self.gradients, dim=(2, 3))
+        try:
+            # Global average pooling of gradients
+            pooled_gradients = torch.mean(self.gradients, dim=(2, 3))
+            
+            # Create a copy of feature maps to avoid modifying original
+            weighted_feature_maps = self.feature_maps.clone()
+            
+            # Weight feature maps by gradients
+            for i in range(pooled_gradients.size(0)):
+                weighted_feature_maps[0, i, :, :] *= pooled_gradients[i]
+            
+            # Average feature maps to get heatmap
+            heatmap = torch.mean(weighted_feature_maps, dim=1).squeeze().detach().cpu()
+            
+            # Apply ReLU to focus on features that have a positive influence
+            heatmap = np.maximum(heatmap.numpy(), 0)
+            
+            # Normalize between 0-1
+            if np.max(heatmap) > 0:
+                heatmap = heatmap / np.max(heatmap)
+                
+            return heatmap, class_idx, score
+        except Exception as e:
+            print(f"Error calculating CAM: {str(e)}")
+            return None, class_idx, score
+            
+    def generate_visualization(self, image_path, output_path=None, alpha=0.4, colormap=cv2.COLORMAP_JET,
+                             class_names=None, display_prediction=True, image_size=128):
+        """
+        Generate and save a Grad-CAM visualization for an image
         
-        # Weight feature maps by gradients
-        for i in range(pooled_gradients.size(0)):
-            self.feature_maps[0, i, :, :] *= pooled_gradients[i]
+        Args:
+            image_path (str): Path to input image
+            output_path (str, optional): Path to save visualization
+            alpha (float): Transparency of heatmap overlay (0-1)
+            colormap: OpenCV colormap to use (default: COLORMAP_JET)
+            class_names (list, optional): Class names for display
+            display_prediction (bool): Whether to display prediction info
+            image_size (int): Size to resize image to
+            
+        Returns:
+            tuple: (visualization_image, predicted_class, confidence)
+        """
+        # Preprocess image
+        input_tensor, original_image = preprocess_image(image_path, image_size)
+        input_tensor = input_tensor.to(self.device)
         
-        # Average feature maps to get heatmap
-        heatmap = torch.mean(self.feature_maps, dim=1).squeeze().detach().cpu()
-        
-        # Apply ReLU to focus on features that have a positive influence
-        heatmap = np.maximum(heatmap.numpy(), 0)
-        
-        # Normalize between 0-1
-        if np.max(heatmap) > 0:
-            heatmap = heatmap / np.max(heatmap)
-        
-        return heatmap, class_idx, score
+        # Generate GRAD-CAM
+        print(f"Generating GRAD-CAM for {image_path}...")
+        try:
+            heatmap, pred_class, prob = self(input_tensor)
+            
+            if heatmap is None:
+                print("Failed to generate heatmap")
+                return None, pred_class, prob
+                
+            # Convert original image to numpy array
+            img_np = np.array(original_image)
+            
+            # Resize heatmap to match original image size
+            heatmap_resized = cv2.resize(heatmap, (img_np.shape[1], img_np.shape[0]))
+            
+            # Apply colormap to create colored heatmap
+            heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), colormap)
+            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+            
+            # Create blended image
+            superimposed = heatmap_colored * alpha + img_np * (1 - alpha)
+            superimposed = np.uint8(superimposed)
+            
+            # Create figure
+            plt.figure(figsize=(15, 5))
+            
+            # Plot original image
+            plt.subplot(1, 3, 1)
+            plt.imshow(img_np)
+            plt.title("Original Image")
+            plt.axis('off')
+            
+            # Plot heatmap
+            plt.subplot(1, 3, 2)
+            plt.imshow(heatmap_resized, cmap='jet')
+            plt.title("Activation Map")
+            plt.axis('off')
+            
+            # Plot superimposed image
+            plt.subplot(1, 3, 3)
+            plt.imshow(superimposed)
+            
+            # Set title with prediction info
+            if display_prediction:
+                if class_names and pred_class < len(class_names):
+                    title = f"Pred: {class_names[pred_class]} ({prob:.2f})"
+                else:
+                    title = f"Pred: Class {pred_class} ({prob:.2f})"
+                plt.title(f"Grad-CAM: {title}")
+            else:
+                plt.title("Grad-CAM Visualization")
+                
+            plt.axis('off')
+            plt.tight_layout()
+            
+            # Save or display
+            if output_path:
+                plt.savefig(output_path, dpi=150, bbox_inches='tight')
+                print(f"Saved visualization to {output_path}")
+                plt.close()
+            else:
+                plt.show()
+                
+            return superimposed, pred_class, prob
+            
+        except Exception as e:
+            print(f"Error generating visualization: {str(e)}")
+            return None, None, 0.0
 
 def preprocess_image(image_path, image_size=128):
-    """Preprocess an image for the model"""
+    """
+    Preprocess an image for the model
+    
+    Args:
+        image_path (str): Path to the image
+        image_size (int): Size to resize the image to
+        
+    Returns:
+        tuple: (tensor, image)
+    """
     # Load image
     image = Image.open(image_path).convert('RGB')
     
@@ -267,7 +403,7 @@ def batch_process_directory(input_dir, model_path, output_dir, model_type='resne
 def main():
     parser = argparse.ArgumentParser(description='Improved GRAD-CAM for TB X-ray Classification')
     parser.add_argument('--input', type=str, required=True, help='Path to input image or directory')
-    parser.add_argument('--model', type=str, required=True, help='Path to model weights')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to model weights')
     parser.add_argument('--output', type=str, default=None, help='Path to save visualization')
     parser.add_argument('--model_type', type=str, choices=['resnet', 'simple'], default='resnet', help='Model architecture')
     parser.add_argument('--batch', action='store_true', help='Process entire directory in batch mode')
