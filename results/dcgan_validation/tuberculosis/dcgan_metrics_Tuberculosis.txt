@@ -2,5 +2,3 @@ DCGAN Evaluation for Tuberculosis Class
 Model Path: output_20250423_211607/dcgan/models/generator_Tuberculosis_50.pth
 Number of generated images: 100
 Number of real images: 100
-
-FID Score: 445.7032 (lower is better)

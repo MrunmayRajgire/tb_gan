@@ -3,4 +3,3 @@ Model Path: output_20250423_211607/dcgan/models/generator_Normal_50.pth
 Number of generated images: 100
 Number of real images: 100
 
-FID Score: 578.1152 (lower is better)
