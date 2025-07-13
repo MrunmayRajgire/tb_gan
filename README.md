@@ -267,13 +267,3 @@ This project demonstrates:
 
 4. **Medical dataset augmentation**: Generated images can help address class imbalance and data scarcity issues common in medical imaging datasets.
 
-## Future Work
-
-Potential extensions to this project:
-- Implement additional GAN architectures (StyleGAN, CycleGAN)
-- Explore semi-supervised learning using generated images
-- Develop a web-based interface for real-time TB detection
-- Extend the model to multi-class classification for different lung diseases
-- Integrate the system with DICOM image support for clinical deployment
-- Optimize models for mobile deployment in resource-limited settings
-
