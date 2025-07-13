@@ -150,13 +150,13 @@ Parameters:
 Classify a single image:
 
 ```bash
-python src/classify_images.py --model_path output_20250423_211607/classifier/models/best_classifier_model.pth --input_path dataset/TB_Chest_Radiography_Database/Tuberculosis/Tuberculosis-1.png --model_type resnet
+python src/classify_images.py --model_path output_20250423_211607/classifier/models/best_classifier_model.pth --input dataset/TB_Chest_Radiography_Database/Tuberculosis/Tuberculosis-1.png --model_type resnet
 ```
 
 Classify a directory of images:
 
 ```bash
-python src/classify_images.py --model_path output_20250423_211607/classifier/models/best_classifier_model.pth --input_path dataset/TB_Chest_Radiography_Database/Tuberculosis --model_type resnet --batch_mode --output_csv results/classification_results.csv
+python src/classify_images.py --model_path output_20250423_211607/classifier/models/best_classifier_model.pth --input dataset/TB_Chest_Radiography_Database/Tuberculosis --model_type resnet --batch_mode --output_csv results/classification_results.csv
 ```
 
 Parameters:
